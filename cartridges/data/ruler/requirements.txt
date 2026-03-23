@@ -1,4 +1,4 @@
-html2
+html2text
 bs4
 nltk
 wonderwords
