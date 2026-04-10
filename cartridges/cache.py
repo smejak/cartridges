@@ -206,6 +206,58 @@ class TrainableCache(nn.Module):
         )
 
     @classmethod
+    def stack_caches(cls, caches: list["TrainableCache"]) -> "TrainableCache":
+        """Stack multiple trained caches by concatenating their KV tensors.
+
+        All caches must share the same AttnConfig (n_layers, n_heads, head_dim).
+        The stacked cache preserves the [frozen | trainable] layout: all frozen
+        tokens from all caches come first, then all trainable tokens.
+        All tokens retain CARTRIDGE_SEQ_ID = -1.
+
+        Args:
+            caches: List of TrainableCache objects to stack.
+
+        Returns:
+            A new TrainableCache with concatenated KV tensors.
+        """
+        assert len(caches) > 0, "Need at least one cache to stack"
+        config = caches[0].config
+        for c in caches:
+            assert c.config == config, (
+                f"All caches must share the same AttnConfig, got {c.config} vs {config}"
+            )
+
+        total_frozen = sum(c._num_frozen_tokens for c in caches)
+        has_frozen = any(c._num_frozen_tokens > 0 for c in caches)
+
+        init_keys = []
+        init_values = []
+        for layer_idx in range(config.n_layers):
+            layer_keys = []
+            layer_values = []
+            # Frozen tokens first (from all caches)
+            if has_frozen:
+                for c in caches:
+                    if c._num_frozen_tokens > 0:
+                        layer_keys.append(c.frozen_keys[layer_idx].data)
+                        layer_values.append(c.frozen_values[layer_idx].data)
+            # Then trainable tokens (from all caches)
+            for c in caches:
+                if c._num_trainable_tokens > 0:
+                    layer_keys.append(c.trainable_keys[layer_idx].data)
+                    layer_values.append(c.trainable_values[layer_idx].data)
+
+            init_keys.append(torch.cat(layer_keys, dim=2))
+            init_values.append(torch.cat(layer_values, dim=2))
+
+        return cls(
+            config=config,
+            init_keys=init_keys,
+            init_values=init_values,
+            num_frozen_tokens=total_frozen,
+        )
+
+    @classmethod
     def from_pretrained(cls, path: str, device: Optional[str] = None):
         if not isinstance(path, str):
             raise TypeError(f"path must be a string, got {type(path)}")
