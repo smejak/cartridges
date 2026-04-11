@@ -1,15 +1,11 @@
 """Modal orchestration for the per-patient cartridge stacking experiment.
 
-Phases:
-  1. Data preparation (runs inside GPU functions to avoid separate step)
-  2. Per-patient training (1 GPU each, patient_01 first as early-stop gate)
-  3. Stacked evaluation with attention capture (canonical orderings)
-  4. Permutation evaluation (320 tasks, batched at max 10 GPUs)
-  5. Figure generation (local)
+Uses a remote orchestrator function so `modal run --detach` works correctly.
 
 Usage:
-    modal run modal_app.py          # Run the full experiment
-    modal run modal_app.py --phase 2  # Run only Phase 2
+    modal run --detach modal_app.py
+    modal run --detach modal_app.py --phase 2   # training only
+    modal run --detach modal_app.py --phase 4   # eval only (needs trained caches)
 """
 import json
 import os
@@ -23,7 +19,10 @@ import modal
 # Modal configuration
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parents[4]  # cartridges repo root
+if modal.is_local():
+    REPO_ROOT = Path(__file__).resolve().parents[4]
+else:
+    REPO_ROOT = Path("/root/cartridges_repo")
 
 app = modal.App("cartridge-stacking")
 
@@ -55,35 +54,34 @@ image = (
         "CARTRIDGES_OUTPUT_DIR": "/data",
         "CARTRIDGES_DIR": "/root/cartridges_repo",
     })
+    .add_local_dir(
+        str(REPO_ROOT),
+        remote_path="/root/cartridges_repo",
+        ignore=[
+            "**/__pycache__",
+            "**/.git",
+            "**/node_modules",
+            "**/viz",
+            "**/*.egg-info",
+            "**/.mypy_cache",
+        ],
+    )
 )
 
-# Mount the repo code so it's available inside the container
-code_mount = modal.Mount.from_local_dir(
-    str(REPO_ROOT),
-    remote_path="/root/cartridges_repo",
-    condition=lambda path: (
-        not path.startswith(".")
-        and "__pycache__" not in path
-        and ".egg-info" not in path
-        and "node_modules" not in path
-        and "viz" not in path
-    ),
-)
+secrets = [modal.Secret.from_name("jakub-api-keys")]
 
-# Secrets for wandb and HF
-secrets = [modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")]
-
-# Shared constants (mirrored from config.py to avoid import issues)
 PATIENT_IDS = [f"patient_{i:02d}" for i in range(1, 6)]
-NUM_TOKENS = 512
 EARLY_STOP_ACCURACY = 0.80
 
-# ---------------------------------------------------------------------------
-# Helper: set up the Python path inside the container
-# ---------------------------------------------------------------------------
+COMMON_KWARGS = dict(
+    image=image,
+    volumes={"/data": volume, "/root/.cache/huggingface": hf_cache},
+    secrets=secrets,
+    memory=32768,
+)
+
 
 def _setup_env():
-    """Set up sys.path and env vars inside a Modal container."""
     repo = "/root/cartridges_repo"
     stacking = os.path.join(repo, "examples/benchmarks/longhealth/stacking")
     for p in [repo, stacking]:
@@ -97,70 +95,33 @@ def _setup_env():
 # Phase 1+2: Train a single patient's cartridge
 # ---------------------------------------------------------------------------
 
-@app.function(
-    image=image,
-    gpu="H100",
-    timeout=7200,
-    volumes={"/data": volume, "/root/.cache/huggingface": hf_cache},
-    mounts=[code_mount],
-    secrets=secrets,
-    memory=32768,
-)
+@app.function(gpu="H100", timeout=7200, **COMMON_KWARGS)
 def train_patient(patient_idx: int) -> dict:
-    """Train one patient's cartridge. Returns accuracy dict."""
     _setup_env()
 
     from prepare_data import export_patient_text_files, filter_and_write_per_patient_parquets
-    from config import patient_cache_path, patient_data_path, patient_text_path
+    from config import patient_cache_path, patient_data_path, patient_text_path, patient_cache_dir
 
     patient_id = f"patient_{patient_idx:02d}"
 
-    # Phase 1: Prepare data for this patient (idempotent)
+    # Phase 1: Prepare data (idempotent)
     if not os.path.exists(patient_data_path(patient_id)):
         filter_and_write_per_patient_parquets()
     if not os.path.exists(patient_text_path(patient_id)):
         export_patient_text_files()
-
     volume.commit()
 
     # Phase 2: Train
     from per_patient_train import make_config
     config = make_config(patient_id)
+    config.run_dir = os.path.join(patient_cache_dir(patient_id), config.name)
+    os.makedirs(config.run_dir, exist_ok=True)
     config.run()
-
     volume.commit()
 
-    # Read final eval results from wandb or compute accuracy from the results
-    # The training script logs to wandb, but we also return accuracy directly
-    import glob
-    import pandas as pd
-
-    results_pattern = os.path.join(config.run_dir, "**", "*.json")
-    result_files = glob.glob(results_pattern, recursive=True)
-
-    # Parse accuracy from the training logs if available
-    accuracy = None
-    try:
-        import wandb
-        api = wandb.Api()
-        runs = api.runs(
-            f"jakub-smekal/cartridges",
-            filters={"tags": {"$in": [patient_id]}, "state": "finished"},
-            order="-created_at",
-        )
-        if runs:
-            run = runs[0]
-            for key in run.summary.keys():
-                if "score" in key and patient_id in key:
-                    accuracy = run.summary[key]
-                    break
-    except Exception:
-        pass
-
-    # Fallback: run a quick eval
-    if accuracy is None:
-        accuracy = _quick_eval(patient_id)
-
+    # Get accuracy — the training run logs eval to wandb, but also return it
+    accuracy = _quick_eval(patient_id)
+    print(f"[train_patient] {patient_id} final accuracy: {accuracy:.2%}")
     return {
         "patient_id": patient_id,
         "patient_idx": patient_idx,
@@ -170,51 +131,39 @@ def train_patient(patient_idx: int) -> dict:
 
 
 def _quick_eval(patient_id: str) -> float:
-    """Run a quick eval of the trained cartridge on its patient's questions."""
     import torch
     from transformers import AutoTokenizer
     from cartridges.cache import TrainableCache
     from cartridges.data.longhealth.evals import LongHealthMultipleChoiceGenerateDataset
     from cartridges.generation import flex_generate
     from cartridges.models.qwen.modeling_qwen3 import FlexQwen3ForCausalLM
-    from config import (
-        GENERATE_MAX_NEW_TOKENS,
-        MODEL_NAME,
-        TEMPERATURE,
-        patient_cache_path,
-    )
+    from config import GENERATE_MAX_NEW_TOKENS, MODEL_NAME, TEMPERATURE, patient_cache_path
 
     device = "cuda"
     model = FlexQwen3ForCausalLM.from_pretrained(MODEL_NAME).to(device).to(torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model.eval()
 
-    cache_path = patient_cache_path(patient_id)
-    cache = TrainableCache.from_pretrained(cache_path, device=device).to(torch.bfloat16)
-
+    cache = TrainableCache.from_pretrained(patient_cache_path(patient_id), device=device).to(torch.bfloat16)
     dataset = LongHealthMultipleChoiceGenerateDataset(
         config=LongHealthMultipleChoiceGenerateDataset.Config(patient_ids=[patient_id]),
-        tokenizer=tokenizer,
-        seed=42,
+        tokenizer=tokenizer, seed=42,
     )
 
     correct = 0
     for i in range(len(dataset)):
-        element = dataset[i]
-        input_ids = element.input_ids[0].to(device)
+        elem = dataset[i]
+        input_ids = elem.input_ids[0].to(device)
         seq_ids = torch.zeros(input_ids.shape[0], dtype=torch.long, device=device)
-        position_ids = torch.arange(input_ids.shape[0], device=device)
-
+        pos_ids = torch.arange(input_ids.shape[0], device=device)
         with torch.no_grad():
             pred_ids = flex_generate(
-                model=model, tokenizer=tokenizer,
-                input_ids=input_ids, seq_ids=seq_ids, position_ids=position_ids,
-                cache=cache, max_new_tokens=GENERATE_MAX_NEW_TOKENS,
-                temperature=TEMPERATURE,
+                model=model, tokenizer=tokenizer, input_ids=input_ids,
+                seq_ids=seq_ids, position_ids=pos_ids, cache=cache,
+                max_new_tokens=GENERATE_MAX_NEW_TOKENS, temperature=TEMPERATURE,
             )
-
-        pred_text = tokenizer.decode(pred_ids.get(0, []), skip_special_tokens=True)
-        is_correct, _ = dataset.score(pred=pred_text, answer=element.answer, convo_id=element.convo_id)
+        pred = tokenizer.decode(pred_ids.get(0, []), skip_special_tokens=True)
+        is_correct, _ = dataset.score(pred=pred, answer=elem.answer, convo_id=elem.convo_id)
         correct += int(is_correct)
 
     del model, cache
@@ -223,20 +172,11 @@ def _quick_eval(patient_id: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Phase 4a: Stacked evaluation with attention capture
+# Phase 4a: Stacked evaluation
 # ---------------------------------------------------------------------------
 
-@app.function(
-    image=image,
-    gpu="H100",
-    timeout=3600,
-    volumes={"/data": volume, "/root/.cache/huggingface": hf_cache},
-    mounts=[code_mount],
-    secrets=secrets,
-    memory=32768,
-)
+@app.function(gpu="H100", timeout=3600, **COMMON_KWARGS)
 def evaluate_stack(patient_ids: list[str], capture_attention: bool = True) -> dict:
-    """Evaluate a single stacked configuration."""
     _setup_env()
     volume.reload()
 
@@ -246,10 +186,8 @@ def evaluate_stack(patient_ids: list[str], capture_attention: bool = True) -> di
         capture_attention=capture_attention,
         log_to_wandb=True,
     )
-
     overall_acc = df["is_correct"].mean()
     per_patient = df.groupby("question_patient")["is_correct"].mean().to_dict()
-
     return {
         "patient_ids": patient_ids,
         "ordering": "_".join(patient_ids),
@@ -262,90 +200,67 @@ def evaluate_stack(patient_ids: list[str], capture_attention: bool = True) -> di
 # Phase 4b: Permutation evaluation batch
 # ---------------------------------------------------------------------------
 
-@app.function(
-    image=image,
-    gpu="H100",
-    timeout=10800,
-    volumes={"/data": volume, "/root/.cache/huggingface": hf_cache},
-    mounts=[code_mount],
-    secrets=secrets,
-    memory=32768,
-)
+@app.function(gpu="H100", timeout=10800, **COMMON_KWARGS)
 def evaluate_permutation_batch(tasks: list[dict]) -> list[dict]:
-    """Evaluate a batch of permutation tasks (model loaded once)."""
     _setup_env()
     volume.reload()
-
     from permutation_eval import run_worker
-    results = run_worker(tasks, capture_attention=False, log_to_wandb=True)
-    return results
+    return run_worker(tasks, capture_attention=False, log_to_wandb=True)
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint: orchestrate everything
+# Remote orchestrator — this is what --detach keeps alive
 # ---------------------------------------------------------------------------
 
-@app.local_entrypoint()
-def main(phase: int = 0):
-    """
-    Run the full experiment or a specific phase.
-    phase=0 (default): run all phases
-    phase=2: training only
-    phase=4: evaluation only (requires trained caches)
-    """
-    import time
+@app.function(timeout=86400, **COMMON_KWARGS)  # no GPU, 24h timeout
+def orchestrate(phase: int = 0):
+    """Run the full experiment from a remote container (detach-safe)."""
+    print("=" * 60)
+    print("CARTRIDGE STACKING EXPERIMENT — ORCHESTRATOR")
+    print("=" * 60)
 
     if phase in (0, 2):
-        print("=" * 60)
-        print("PHASE 2a: Training patient_01 (early stop gate)")
-        print("=" * 60)
-
+        # --- Phase 2a: Train patient_01 (early stop gate) ---
+        print("\n[Phase 2a] Training patient_01 (early stop gate)...")
         result = train_patient.remote(1)
         acc = result["accuracy"]
-        print(f"patient_01 accuracy: {acc:.2%}")
+        print(f"  patient_01 accuracy: {acc:.2%}")
 
         if acc < EARLY_STOP_ACCURACY:
-            print(f"GATE FAILED: {acc:.2%} < {EARLY_STOP_ACCURACY:.0%}")
-            print("Increase NUM_TOKENS (set CARTRIDGES_NUM_TOKENS env var) and retry.")
-            return
+            print(f"  GATE FAILED: {acc:.2%} < {EARLY_STOP_ACCURACY:.0%}")
+            print("  Increase CARTRIDGES_NUM_TOKENS and retry.")
+            return {"status": "gate_failed", "accuracy": acc}
 
-        print("Gate passed! Training patients 2-5 in parallel...")
+        # --- Phase 2b: Train patients 2-5 in parallel ---
+        print("\n[Phase 2b] Gate passed! Training patients 2-5 in parallel...")
         handles = [train_patient.spawn(i) for i in range(2, 6)]
         for h in handles:
             r = h.get()
             print(f"  {r['patient_id']}: accuracy={r['accuracy']:.2%}")
 
     if phase in (0, 4):
-        print()
-        print("=" * 60)
-        print("PHASE 4a: Canonical stacked evaluations")
-        print("=" * 60)
-
-        # Evaluate canonical orderings k=2..5 (with attention capture)
+        # --- Phase 4a: Canonical stacked evaluations ---
+        print("\n[Phase 4a] Canonical stacked evaluations...")
         canonical_handles = []
         for k in range(2, len(PATIENT_IDS) + 1):
             pids = PATIENT_IDS[:k]
             print(f"  Submitting k={k}: {pids}")
             canonical_handles.append(evaluate_stack.spawn(pids, capture_attention=True))
 
-        for h in canonical_handles:
-            r = h.get()
-            print(f"  {r['ordering']}: overall={r['overall_accuracy']:.2%}")
-
-        # Also evaluate each single patient (for the figures, k=1 data)
+        # Also evaluate each single patient for figures
         single_handles = []
         for pid in PATIENT_IDS:
             single_handles.append(evaluate_stack.spawn([pid], capture_attention=False))
+
+        for h in canonical_handles:
+            r = h.get()
+            print(f"  {r['ordering']}: overall={r['overall_accuracy']:.2%}")
         for h in single_handles:
             r = h.get()
             print(f"  {r['ordering']}: {r['overall_accuracy']:.2%}")
 
-        print()
-        print("=" * 60)
-        print("PHASE 4b: Permutation evaluations (320 tasks)")
-        print("=" * 60)
-
-        # Generate all permutation tasks
+        # --- Phase 4b: Permutation evaluations ---
+        print(f"\n[Phase 4b] Permutation evaluations...")
         all_tasks = []
         for k in [2, 3, 4, 5]:
             for perm in permutations(range(len(PATIENT_IDS)), k):
@@ -356,39 +271,46 @@ def main(phase: int = 0):
                     "patient_ids": pids,
                     "ordering_str": "_".join(pids),
                 })
+        print(f"  Total permutation tasks: {len(all_tasks)}")
 
-        print(f"Total permutation tasks: {len(all_tasks)}")
-
-        # Distribute across 10 workers (max 10 concurrent GPUs)
+        # Distribute across 10 workers
         num_workers = 10
         worker_batches = [[] for _ in range(num_workers)]
         for i, task in enumerate(all_tasks):
             worker_batches[i % num_workers].append(task)
 
         all_results = []
-        for batch_start in range(0, num_workers, 10):
-            batch_end = min(batch_start + 10, num_workers)
-            batch_handles = []
-            for w in range(batch_start, batch_end):
-                if worker_batches[w]:
-                    batch_handles.append(
-                        evaluate_permutation_batch.spawn(worker_batches[w])
-                    )
+        batch_handles = []
+        for w in range(num_workers):
+            if worker_batches[w]:
+                batch_handles.append(evaluate_permutation_batch.spawn(worker_batches[w]))
 
-            for h in batch_handles:
-                results = h.get()
-                all_results.extend(results)
-                print(f"  Completed batch: {len(results)} evaluations")
+        for h in batch_handles:
+            results = h.get()
+            all_results.extend(results)
+            print(f"  Completed batch: {len(results)} evaluations")
 
-        # Save aggregated results locally
-        out_path = "permutation_results_all.json"
+        # Save to volume
+        results_dir = "/data/stacking/results"
+        os.makedirs(results_dir, exist_ok=True)
+        out_path = os.path.join(results_dir, "permutation_results_all.json")
         with open(out_path, "w") as f:
             json.dump(all_results, f, indent=2)
-        print(f"Saved {len(all_results)} results to {out_path}")
+        volume.commit()
+        print(f"  Saved {len(all_results)} results to {out_path}")
 
-    if phase in (0, 5):
-        print()
-        print("=" * 60)
-        print("PHASE 5: Generating figures (local)")
-        print("=" * 60)
-        print("Run: python plot_results.py")
+    print("\n" + "=" * 60)
+    print("EXPERIMENT COMPLETE")
+    print("=" * 60)
+    return {"status": "complete"}
+
+
+# ---------------------------------------------------------------------------
+# Local entrypoint — just kicks off the remote orchestrator
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def main(phase: int = 0):
+    """Kick off the remote orchestrator (safe to --detach)."""
+    result = orchestrate.remote(phase)
+    print(f"Final result: {result}")

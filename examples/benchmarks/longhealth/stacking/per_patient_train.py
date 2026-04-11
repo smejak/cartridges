@@ -9,7 +9,6 @@ import os
 import sys
 
 import pydrantic
-from pydrantic.variables import FormatStringVariable
 
 from cartridges.initialization import KVFromText
 from cartridges.models.config import HFModelConfig
@@ -85,9 +84,7 @@ def make_config(patient_id: str) -> TrainConfig:
             tags=["train", "longhealth", "stacking", "per-patient", patient_id],
         ),
         output_dir=patient_cache_dir(patient_id),
-        name=FormatStringVariable(
-            f"stacking_{patient_id}_toks{{kv_cache_initializer.max_tokens}}"
-        ),
+        name=f"stacking_{patient_id}_toks{NUM_TOKENS}",
     )
 
 
