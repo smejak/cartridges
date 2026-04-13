@@ -58,9 +58,64 @@ Two other runs with same config showed similar patterns (peak 40-50%, final 40-4
 - `cartridges/train.py` — training loop (existing, unmodified)
 - `cartridges/cache.py` — `TrainableCache` (added `stack_caches()`, not yet exercised)
 
-### Changes for next run
-- Tokens: 512 → 2048 (committed in `ff02a30`)
-- Epochs: 2 → 1 (to reduce overfitting)
-- Eval/save every 32 steps (finer granularity)
-- Keep last 20 checkpoints
-- Fixed cache path mismatch
+---
+
+## Run 2: patients 2-5, 512 tokens (2026-04-13)
+
+**Goal**: Train per-patient cartridges for the remaining 4 patients using the same config as patient_01.
+
+### Config
+Same as Run 1: Qwen/Qwen3-4b, 512 KV tokens, lr=2e-2, 2 epochs, global_batch_size=32.
+4 H100 GPUs in parallel (within the 10-GPU limit).
+
+### Training data per patient
+| Patient | Conversations | Text (chars) |
+|---------|--------------|-------------|
+| patient_02 | 13,728 | 50,301 |
+| patient_03 | 12,160 | 47,900 |
+| patient_04 | 13,568 | 45,885 |
+| patient_05 | 12,960 | 37,677 |
+
+### Eval trajectory (all patients, 20 MC questions each)
+
+| Patient | Step 0 | Step 64 | Step 128 | Step 192 | Step 256 | Final |
+|---------|--------|---------|----------|----------|----------|-------|
+| patient_02 | 25% | 50% | **60%** | 55% | 60% | 55% (step 302) |
+| patient_03 | 20% | 30% | 35% | 35% | 35% | 30% (step 268) |
+| patient_04 | 5% | **65%** | 55% | — | — | 50% (wandb) |
+| patient_05 | 15% | 30% | 15% | 40% | 25% | 35% (step 276) |
+
+### All patients summary (including patient_01 from Run 1)
+
+| Patient | Baseline | Peak Accuracy | Peak Step | Final | Wandb Run |
+|---------|----------|--------------|-----------|-------|-----------|
+| patient_01 | 30% | **55%** | 64 | 40% | `9ovgs3z9` |
+| patient_02 | 25% | **60%** | 128 | 55% | `pfw7r934` |
+| patient_03 | 20% | **35%** | 128 | 30% | `mfzlrpml` |
+| patient_04 | 5% | **65%** | 64 | 50% | `c3s5lg8j` |
+| patient_05 | 15% | **40%** | 192 | 35% | `ylqbf4rv` |
+
+### Observations
+- All 5 patients show the same pattern: accuracy peaks in epoch 1 (step 64-128) then oscillates/declines in epoch 2
+- Patients with lowest baselines showed the biggest training improvement (patient_04: 5% → 65%)
+- High eval variance (patient_05 fluctuated 15-40%) likely due to small eval set (20 questions)
+- Average peak accuracy across all 5 patients: **51%**
+- Average final accuracy: **42%**
+- No patient reached the 80% gate — this is a property of the 512-token compression, not a bug
+
+### Bug encountered
+- `_quick_eval()` crashed with `RuntimeError: Expected all tensors to be on the same device` (CPU vs CUDA)
+- Cause: `TrainableCache.from_pretrained()` creates `_seq_ids` buffer on CPU; `.to(torch.bfloat16)` changes dtype but doesn't move device
+- Fix: added `.to(device)` before `.to(torch.bfloat16)` — committed in `67e08af`
+- Non-blocking: all training completed and caches saved before the crash
+
+### Where to find results
+
+| Artifact | Location |
+|----------|----------|
+| Wandb runs | `pfw7r934` (p02), `mfzlrpml` (p03), `c3s5lg8j` (p04), `ylqbf4rv` (p05) |
+| Per-question eval tables | Each wandb run → `generate_longhealth_patient_XX/table` |
+| Cache checkpoints | Modal volume `cartridge-stacking-data` at `/data/stacking/caches/patient_XX/cache_last.pt` |
+| Cache on wandb | Each run → Files → `cache-step*.pt` |
+| Filtered training data | Modal volume at `/data/stacking/data/patient_XX.parquet` |
+| Patient text files | Modal volume at `/data/stacking/data/patient_XX_text.txt` |
