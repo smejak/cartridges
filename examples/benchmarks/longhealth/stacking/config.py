@@ -9,11 +9,15 @@ PATIENT_IDS = [f"patient_{idx:02d}" for idx in PATIENT_IDXS]
 MODEL_NAME = "Qwen/Qwen3-4b"
 
 # --- Cartridge ---
-NUM_TOKENS = int(os.environ.get("CARTRIDGES_NUM_TOKENS", "512"))
+# Bumped from 512 → 2048 after observing 40-55% eval accuracy at 512 tokens
+# (well below the 80% gate). 2048 matches the existing all-patient training.
+NUM_TOKENS = int(os.environ.get("CARTRIDGES_NUM_TOKENS", "2048"))
 
 # --- Training hyperparameters ---
 LR = 2e-2
-EPOCHS = 2
+# Reduced from 2 → 1 after observing overfitting at 512 tokens (peak eval
+# accuracy at step 64 of 293, then decline as train loss kept dropping).
+EPOCHS = 1
 GLOBAL_BATCH_SIZE = 32
 PACKED_SEQ_LENGTH = 2048
 TOP_K_LOGITS = 20

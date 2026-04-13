@@ -114,7 +114,9 @@ def train_patient(patient_idx: int) -> dict:
     # Phase 2: Train
     from per_patient_train import make_config
     config = make_config(patient_id)
-    config.run_dir = os.path.join(patient_cache_dir(patient_id), config.name)
+    # Save cache directly to patient_cache_dir (no extra subdir) so
+    # patient_cache_path() points to the actual saved file.
+    config.run_dir = patient_cache_dir(patient_id)
     os.makedirs(config.run_dir, exist_ok=True)
     config.run()
     volume.commit()
