@@ -146,7 +146,7 @@ def _quick_eval(patient_id: str) -> float:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model.eval()
 
-    cache = TrainableCache.from_pretrained(patient_cache_path(patient_id), device=device).to(torch.bfloat16)
+    cache = TrainableCache.from_pretrained(patient_cache_path(patient_id), device=device).to(device).to(torch.bfloat16)
     dataset = LongHealthMultipleChoiceGenerateDataset(
         config=LongHealthMultipleChoiceGenerateDataset.Config(patient_ids=[patient_id]),
         tokenizer=tokenizer, seed=42,
@@ -215,27 +215,24 @@ def evaluate_permutation_batch(tasks: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 @app.function(timeout=86400, **COMMON_KWARGS)  # no GPU, 24h timeout
-def orchestrate(phase: int = 0):
-    """Run the full experiment from a remote container (detach-safe)."""
+def orchestrate(phase: int = 0, patient_idxs: list[int] = None):
+    """Run the full experiment from a remote container (detach-safe).
+
+    Args:
+        phase: 0=all, 2=training only, 4=eval only
+        patient_idxs: which patients to train (default: all 5)
+    """
     print("=" * 60)
     print("CARTRIDGE STACKING EXPERIMENT — ORCHESTRATOR")
     print("=" * 60)
 
+    if patient_idxs is None:
+        patient_idxs = list(range(1, 6))
+
     if phase in (0, 2):
-        # --- Phase 2a: Train patient_01 (early stop gate) ---
-        print("\n[Phase 2a] Training patient_01 (early stop gate)...")
-        result = train_patient.remote(1)
-        acc = result["accuracy"]
-        print(f"  patient_01 accuracy: {acc:.2%}")
-
-        if acc < EARLY_STOP_ACCURACY:
-            print(f"  GATE FAILED: {acc:.2%} < {EARLY_STOP_ACCURACY:.0%}")
-            print("  Increase CARTRIDGES_NUM_TOKENS and retry.")
-            return {"status": "gate_failed", "accuracy": acc}
-
-        # --- Phase 2b: Train patients 2-5 in parallel ---
-        print("\n[Phase 2b] Gate passed! Training patients 2-5 in parallel...")
-        handles = [train_patient.spawn(i) for i in range(2, 6)]
+        print(f"\n[Phase 2] Training patients {patient_idxs} in parallel...")
+        print(f"  GPUs requested: {len(patient_idxs)}")
+        handles = [train_patient.spawn(i) for i in patient_idxs]
         for h in handles:
             r = h.get()
             print(f"  {r['patient_id']}: accuracy={r['accuracy']:.2%}")
@@ -312,7 +309,13 @@ def orchestrate(phase: int = 0):
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def main(phase: int = 0):
-    """Kick off the remote orchestrator (safe to --detach)."""
-    result = orchestrate.remote(phase)
+def main(phase: int = 0, patients: str = ""):
+    """Kick off the remote orchestrator (safe to --detach).
+
+    Args:
+        phase: 0=all, 2=training only, 4=eval only
+        patients: comma-separated patient indices, e.g. "2,3,4,5". Empty = all 5.
+    """
+    patient_idxs = [int(x) for x in patients.split(",") if x.strip()] or None
+    result = orchestrate.remote(phase, patient_idxs=patient_idxs)
     print(f"Final result: {result}")

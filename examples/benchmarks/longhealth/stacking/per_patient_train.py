@@ -63,9 +63,8 @@ def make_config(patient_id: str) -> TrainConfig:
             packing_mode="truncate",
         ),
 
-        save_every_n_steps=32,
-        generate_eval_every_n_steps=32,
-        keep_last_n_saved=20,  # keep enough checkpoints to pick best
+        save_every_n_steps=256,
+        generate_eval_every_n_steps=64,
         generate_evals=[
             GenerationEvalConfig(
                 dataset=LongHealthMultipleChoiceGenerateDataset.Config(
