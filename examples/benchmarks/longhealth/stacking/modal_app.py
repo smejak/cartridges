@@ -202,7 +202,7 @@ def evaluate_stack(patient_ids: list[str], capture_attention: bool = True) -> di
 # Phase 4a-rope: Stacked evaluation with RoPE adjustment
 # ---------------------------------------------------------------------------
 
-@app.function(gpu="H100", timeout=3600, **COMMON_KWARGS)
+@app.function(gpu="H100", timeout=7200, **COMMON_KWARGS)
 def evaluate_stack_rope(patient_ids: list[str], capture_attention: bool = True) -> dict:
     """Evaluate a stacked cartridge with RoPE-adjusted position re-indexing.
 
@@ -380,6 +380,32 @@ def orchestrate(phase: int = 0, patient_idxs: list[int] = None):
             json.dump(all_results, f, indent=2)
         volume.commit()
         print(f"  Saved {len(all_results)} results to {out_path}")
+
+    if phase in (0, 5):
+        # --- Phase 5: RoPE-adjusted canonical stacked evaluations ---
+        print("\n[Fixup] Checking patient_01 cache path...")
+        fixup_patient01_cache.remote()
+
+        print("\n[Phase 5] RoPE-adjusted stacked evaluations (4 GPUs)...")
+        rope_handles = []
+        for k in range(2, len(PATIENT_IDS) + 1):
+            pids = PATIENT_IDS[:k]
+            print(f"  Submitting rope k={k}: {pids}")
+            rope_handles.append(("rope", k, evaluate_stack_rope.spawn(pids, capture_attention=False)))
+
+        for label, key, h in rope_handles:
+            r = h.get()
+            print(f"  [{label} k={key}] {r['ordering']}: overall={r['overall_accuracy']:.2%}")
+
+    if phase == 6:
+        # --- Retry: just k=5 RoPE-adjusted (timed out at 3600s) ---
+        print("\n[Fixup] Checking patient_01 cache path...")
+        fixup_patient01_cache.remote()
+
+        pids = PATIENT_IDS[:5]
+        print(f"\n[Phase 6] Retrying rope k=5: {pids}")
+        r = evaluate_stack_rope.remote(pids, capture_attention=False)
+        print(f"  [rope k=5] {r['ordering']}: overall={r['overall_accuracy']:.2%}")
 
     print("\n" + "=" * 60)
     print("EXPERIMENT COMPLETE")

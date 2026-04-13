@@ -119,3 +119,76 @@ Same as Run 1: Qwen/Qwen3-4b, 512 KV tokens, lr=2e-2, 2 epochs, global_batch_siz
 | Cache on wandb | Each run → Files → `cache-step*.pt` |
 | Filtered training data | Modal volume at `/data/stacking/data/patient_XX.parquet` |
 | Patient text files | Modal volume at `/data/stacking/data/patient_XX_text.txt` |
+
+---
+
+## Run 3: Phase 4a — Canonical stacked evaluations (2026-04-13)
+
+**Goal**: Evaluate stacked cartridges at k=1..5 using canonical ordering (patients 1..k).
+
+### Single-patient eval (k=1, independent cartridge per patient)
+
+| Patient | Accuracy | Wandb Run |
+|---------|----------|-----------|
+| patient_01 | 50% | `xt7cxzi9` |
+| patient_02 | 55% | `otomiicf` |
+| patient_03 | 35% | `ug50pfp6` |
+| patient_04 | 45% | `v38xpcn4` |
+| patient_05 | 30% | `awjiiyjt` |
+| **Average** | **43%** | |
+
+### Canonical stacked eval (k=2..5)
+
+| Stack | Patients | Accuracy | Wandb Run |
+|-------|----------|----------|-----------|
+| k=2 | p01+p02 | 42.5% | `y51f1ghm` |
+| k=3 | p01+p02+p03 | 26.7% | `kcc7yq8t` |
+| k=4 | p01+p02+p03+p04 | 27.5% | `qghdtgvs` |
+| k=5 | all 5 | **21%** | `qxadyjw3` |
+
+### Accuracy scaling summary
+
+| k | Accuracy | Delta from k=1 avg |
+|---|----------|--------------------|
+| 1 | 43.0% | — |
+| 2 | 42.5% | -0.5pp |
+| 3 | 26.7% | -16.3pp |
+| 4 | 27.5% | -15.5pp |
+| 5 | **21.0%** | **-22.0pp** |
+
+### Observations
+- Sharp accuracy drop at k=3 (26.7%), near-random at k=5 (21% vs 20% random baseline)
+- Strong evidence of RoPE position conflict: each cache has RoPE baked in for positions 0..511, causing overlapping position signals when stacked
+- RoPE-adjusted stacking implemented and ready to test (committed `9f2207f`) — strips old RoPE, re-applies with sequential positions
+- Phase 4b (permutation eval, 320 tasks on 10 GPUs) started automatically after Phase 4a but was stopped early
+
+---
+
+## Run 4: Phase 5 — RoPE-adjusted stacked evaluations (2026-04-13)
+
+**Goal**: Test whether fixing RoPE position conflicts improves stacked accuracy.
+
+Each cache has RoPE baked in for positions 0..511. Naive stacking creates position overlap.
+RoPE-adjusted stacking strips old RoPE, re-applies with sequential positions (cache 0: 0..511, cache 1: 512..1023, etc.).
+
+### Results
+
+| k | Naive | RoPE-adjusted | Delta | Per-patient (RoPE) |
+|---|-------|---------------|-------|--------------------|
+| 2 | **42.5%** | 30.0% | -12.5pp | p01=30%, p02=30% |
+| 3 | 26.7% | **36.7%** | +10.0pp | p01=30%, p02=45%, p03=35% |
+| 4 | 27.5% | **28.75%** | +1.25pp | p01=25%, p02=35%, p03=25%, p04=30% |
+| 5 | 21% | 19% | -2pp | (near random) |
+
+### Wandb runs
+- k=2 rope: `3fhpwy4n`
+- k=3 rope: `oaf5fgcm`
+- k=4 rope: `sa1qn5mi`
+- k=5 rope: (run from phase 6 retry)
+
+### Observations
+- RoPE adjustment helps at k=3 (+10pp) but the benefit fades at k=4 and disappears at k=5
+- At k=5 both approaches are at random chance (~20%)
+- RoPE adjustment actually hurts at k=2 (30% vs 42.5%)
+- The core issue is not just position encoding — cartridges trained in isolation don't compose well when stacked
+- Possible next directions: (a) train cartridges jointly (aware of each other), (b) increase token budget, (c) use a different stacking mechanism
