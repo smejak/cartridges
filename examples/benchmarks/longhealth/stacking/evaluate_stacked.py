@@ -43,20 +43,39 @@ logger = get_logger(__name__)
 
 
 def load_and_stack_caches(
-    patient_ids: list[str], device: str = "cuda"
+    patient_ids: list[str],
+    device: str = "cuda",
+    rope_adjust: bool = False,
+    rope_theta: float = 10000.0,
 ) -> TrainableCache:
-    """Load individual caches and stack them in the given order."""
+    """Load individual caches and stack them in the given order.
+
+    Args:
+        patient_ids: ordered list of patient IDs.
+        device: torch device string.
+        rope_adjust: if True, strip and re-apply RoPE with sequential positions
+            so that stacked caches have non-overlapping position encodings.
+        rope_theta: RoPE base frequency (must match the model's config).
+    """
     caches = []
     for pid in patient_ids:
         path = patient_cache_path(pid)
         logger.info(f"Loading cache for {pid} from {path}")
         cache = TrainableCache.from_pretrained(path, device=device)
         caches.append(cache)
-    stacked = TrainableCache.stack_caches(caches)
-    logger.info(
-        f"Stacked {len(caches)} caches: "
-        f"{stacked.num_cartridge_tokens()} total cartridge tokens"
-    )
+
+    if rope_adjust:
+        stacked = TrainableCache.stack_caches_rope_adjusted(caches, rope_theta=rope_theta)
+        logger.info(
+            f"Stacked {len(caches)} caches with RoPE adjustment: "
+            f"{stacked.num_cartridge_tokens()} total cartridge tokens"
+        )
+    else:
+        stacked = TrainableCache.stack_caches(caches)
+        logger.info(
+            f"Stacked {len(caches)} caches: "
+            f"{stacked.num_cartridge_tokens()} total cartridge tokens"
+        )
     return stacked
 
 
@@ -65,8 +84,18 @@ def evaluate_stacked(
     capture_attention: bool = True,
     log_to_wandb: bool = True,
     seed: int = 42,
+    rope_adjust: bool = False,
 ) -> pd.DataFrame:
-    """Run stacked evaluation and return per-question results DataFrame."""
+    """Run stacked evaluation and return per-question results DataFrame.
+
+    Args:
+        patient_ids: ordered list of patient IDs for the stack.
+        capture_attention: whether to capture attention distributions.
+        log_to_wandb: whether to log results to Weights & Biases.
+        seed: random seed.
+        rope_adjust: if True, use RoPE-adjusted stacking to fix position
+            conflicts across stacked caches.
+    """
     seed_everything(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -77,7 +106,10 @@ def evaluate_stacked(
     model.eval()
 
     # Stack caches
-    stacked_cache = load_and_stack_caches(patient_ids, device=device)
+    rope_theta = getattr(model.config, "rope_theta", 10000.0)
+    stacked_cache = load_and_stack_caches(
+        patient_ids, device=device, rope_adjust=rope_adjust, rope_theta=rope_theta
+    )
     stacked_cache = stacked_cache.to(device).to(torch.bfloat16)
 
     # Attention hook
@@ -171,18 +203,23 @@ def evaluate_stacked(
 
     # Log to wandb
     if log_to_wandb:
-        run_name = f"stacking_eval_{ordering_str}_toks{NUM_TOKENS}"
+        rope_suffix = "_rope" if rope_adjust else ""
+        run_name = f"stacking_eval_{ordering_str}_toks{NUM_TOKENS}{rope_suffix}"
+        tags = ["eval", "stacking", "longhealth", f"k{len(patient_ids)}"]
+        if rope_adjust:
+            tags.append("rope_adjust")
         wandb.init(
             entity=WANDB_ENTITY,
             project=WANDB_PROJECT,
             name=run_name,
-            tags=["eval", "stacking", "longhealth", f"k{len(patient_ids)}"],
+            tags=tags,
             config={
                 "patient_ids": patient_ids,
                 "stack_size": len(patient_ids),
                 "num_tokens_per_cartridge": NUM_TOKENS,
                 "model": MODEL_NAME,
                 "temperature": TEMPERATURE,
+                "rope_adjust": rope_adjust,
             },
         )
 
@@ -235,6 +272,11 @@ if __name__ == "__main__":
     parser.add_argument("--no_attention", action="store_true")
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--rope_adjust", action="store_true",
+        help="Re-index RoPE positions when stacking so caches have sequential "
+             "non-overlapping positions instead of all sharing 0..N-1.",
+    )
     args = parser.parse_args()
 
     evaluate_stacked(
@@ -242,4 +284,5 @@ if __name__ == "__main__":
         capture_attention=not args.no_attention,
         log_to_wandb=not args.no_wandb,
         seed=args.seed,
+        rope_adjust=args.rope_adjust,
     )

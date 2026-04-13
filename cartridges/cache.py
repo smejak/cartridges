@@ -13,6 +13,80 @@ from cartridges.utils import get_logger
 
 logger = get_logger(__name__)
 
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input (same as in modeling_qwen3.py)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _build_rope_cos_sin(
+    positions: torch.Tensor,
+    head_dim: int,
+    rope_theta: float = 10000.0,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute RoPE cos/sin embeddings for the given positions.
+
+    Args:
+        positions: 1-D tensor of integer positions, shape (seq_len,).
+        head_dim: dimension of each attention head.
+        rope_theta: base frequency for RoPE (default 10000.0).
+        dtype: output dtype.
+
+    Returns:
+        cos, sin each of shape (1, 1, seq_len, head_dim), ready to broadcast
+        over (batch, n_heads, seq_len, head_dim) key tensors.
+    """
+    # inv_freq: (head_dim / 2,)
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=positions.device) / head_dim)
+    )
+    # freqs: (seq_len, head_dim / 2)
+    freqs = torch.outer(positions.float(), inv_freq)
+    # emb: (seq_len, head_dim)  -- duplicate for the two halves
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos().unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
+    sin = emb.sin().unsqueeze(0).unsqueeze(0)
+    return cos.to(dtype=dtype), sin.to(dtype=dtype)
+
+
+def strip_rope(keys: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Remove RoPE from key states by applying the inverse rotation.
+
+    RoPE applies:  k_rope = k * cos + rotate_half(k) * sin
+
+    The inverse (since RoPE is an orthogonal rotation) is:
+        k = k_rope * cos + rotate_half(k_rope) * (-sin)
+          = k_rope * cos - rotate_half(k_rope) * sin
+
+    Args:
+        keys: (batch, n_heads, seq_len, head_dim) with RoPE baked in.
+        cos: (1, 1, seq_len, head_dim) cosine embeddings for the original positions.
+        sin: (1, 1, seq_len, head_dim) sine embeddings for the original positions.
+
+    Returns:
+        keys with RoPE removed, same shape.
+    """
+    return keys * cos - _rotate_half(keys) * sin
+
+
+def apply_rope(keys: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to key states.
+
+    k_rope = k * cos + rotate_half(k) * sin
+
+    Args:
+        keys: (batch, n_heads, seq_len, head_dim) without RoPE.
+        cos: (1, 1, seq_len, head_dim) cosine embeddings for the target positions.
+        sin: (1, 1, seq_len, head_dim) sine embeddings for the target positions.
+
+    Returns:
+        keys with RoPE applied, same shape.
+    """
+    return keys * cos + _rotate_half(keys) * sin
+
 @dataclass
 class AttnConfig:
     n_layers: int
@@ -246,6 +320,156 @@ class TrainableCache(nn.Module):
                 if c._num_trainable_tokens > 0:
                     layer_keys.append(c.trainable_keys[layer_idx].data)
                     layer_values.append(c.trainable_values[layer_idx].data)
+
+            init_keys.append(torch.cat(layer_keys, dim=2))
+            init_values.append(torch.cat(layer_values, dim=2))
+
+        return cls(
+            config=config,
+            init_keys=init_keys,
+            init_values=init_values,
+            num_frozen_tokens=total_frozen,
+        )
+
+    @classmethod
+    def stack_caches_rope_adjusted(
+        cls,
+        caches: list["TrainableCache"],
+        rope_theta: float = 10000.0,
+    ) -> "TrainableCache":
+        """Stack multiple caches with RoPE position re-indexing.
+
+        Each cache's key states have RoPE baked in for positions 0..num_tokens-1.
+        When naively stacking, all caches share the same positions, which creates
+        conflicts.  This method:
+
+        1. Strips the original RoPE from each cache's key states (positions 0..L-1).
+        2. Re-applies RoPE with sequential positions across all stacked caches:
+           cache 0 -> 0..L0-1, cache 1 -> L0..L0+L1-1, etc.
+
+        Values are not affected by RoPE and are simply concatenated.
+
+        Args:
+            caches: list of TrainableCache objects to stack.
+            rope_theta: base frequency for RoPE (must match the model's
+                config.rope_theta, default 10000.0 matches Qwen3's default).
+
+        Returns:
+            A new TrainableCache with re-indexed RoPE in key states.
+        """
+        assert len(caches) > 0, "Need at least one cache to stack"
+        config = caches[0].config
+        for c in caches:
+            assert c.config == config, (
+                f"All caches must share the same AttnConfig, got {c.config} vs {config}"
+            )
+
+        head_dim = config.head_dim
+        total_frozen = sum(c._num_frozen_tokens for c in caches)
+        has_frozen = any(c._num_frozen_tokens > 0 for c in caches)
+
+        # Build the per-cache token counts in stacking order:
+        # [frozen_0, frozen_1, ..., trainable_0, trainable_1, ...]
+        # We need to know the size of each segment to compute positions.
+        frozen_lengths = []
+        trainable_lengths = []
+        if has_frozen:
+            for c in caches:
+                if c._num_frozen_tokens > 0:
+                    frozen_lengths.append(c._num_frozen_tokens)
+        for c in caches:
+            if c._num_trainable_tokens > 0:
+                trainable_lengths.append(c._num_trainable_tokens)
+
+        # Compute sequential position assignments for each segment.
+        # Position counter runs across the full stacked sequence.
+        frozen_positions = []  # list of (start_pos, length) for each frozen segment
+        trainable_positions = []  # list of (start_pos, length) for each trainable segment
+        pos = 0
+        if has_frozen:
+            for length in frozen_lengths:
+                frozen_positions.append((pos, length))
+                pos += length
+        for length in trainable_lengths:
+            trainable_positions.append((pos, length))
+            pos += length
+
+        # Also track original positions for stripping: each cache's frozen/trainable
+        # tokens were at positions 0..total_tokens-1 during initialization.
+        # frozen = 0..num_frozen-1, trainable = num_frozen..num_frozen+num_trainable-1
+
+        init_keys = []
+        init_values = []
+        for layer_idx in range(config.n_layers):
+            layer_keys = []
+            layer_values = []
+
+            frozen_seg_idx = 0
+            trainable_seg_idx = 0
+
+            # --- Frozen tokens first ---
+            if has_frozen:
+                for c in caches:
+                    if c._num_frozen_tokens > 0:
+                        k = c.frozen_keys[layer_idx].data  # (1, n_heads, n_frozen, head_dim)
+                        v = c.frozen_values[layer_idx].data
+                        n_frozen = c._num_frozen_tokens
+                        compute_dtype = torch.float32
+
+                        # Original positions for this cache's frozen tokens: 0..n_frozen-1
+                        orig_positions = torch.arange(n_frozen, device=k.device)
+                        old_cos, old_sin = _build_rope_cos_sin(
+                            orig_positions, head_dim, rope_theta, dtype=compute_dtype
+                        )
+
+                        # New sequential positions
+                        new_start, seg_len = frozen_positions[frozen_seg_idx]
+                        new_positions = torch.arange(new_start, new_start + seg_len, device=k.device)
+                        new_cos, new_sin = _build_rope_cos_sin(
+                            new_positions, head_dim, rope_theta, dtype=compute_dtype
+                        )
+
+                        # Strip old RoPE, apply new
+                        k_f32 = k.to(compute_dtype)
+                        k_bare = strip_rope(k_f32, old_cos, old_sin)
+                        k_new = apply_rope(k_bare, new_cos, new_sin)
+
+                        layer_keys.append(k_new.to(k.dtype))
+                        layer_values.append(v)
+                        frozen_seg_idx += 1
+
+            # --- Trainable tokens ---
+            for c in caches:
+                if c._num_trainable_tokens > 0:
+                    k = c.trainable_keys[layer_idx].data  # (1, n_heads, n_train, head_dim)
+                    v = c.trainable_values[layer_idx].data
+                    n_train = c._num_trainable_tokens
+                    n_frozen_in_cache = c._num_frozen_tokens
+                    compute_dtype = torch.float32
+
+                    # Original positions for trainable tokens: n_frozen..n_frozen+n_train-1
+                    orig_positions = torch.arange(
+                        n_frozen_in_cache, n_frozen_in_cache + n_train, device=k.device
+                    )
+                    old_cos, old_sin = _build_rope_cos_sin(
+                        orig_positions, head_dim, rope_theta, dtype=compute_dtype
+                    )
+
+                    # New sequential positions
+                    new_start, seg_len = trainable_positions[trainable_seg_idx]
+                    new_positions = torch.arange(new_start, new_start + seg_len, device=k.device)
+                    new_cos, new_sin = _build_rope_cos_sin(
+                        new_positions, head_dim, rope_theta, dtype=compute_dtype
+                    )
+
+                    # Strip old RoPE, apply new
+                    k_f32 = k.to(compute_dtype)
+                    k_bare = strip_rope(k_f32, old_cos, old_sin)
+                    k_new = apply_rope(k_bare, new_cos, new_sin)
+
+                    layer_keys.append(k_new.to(k.dtype))
+                    layer_values.append(v)
+                    trainable_seg_idx += 1
 
             init_keys.append(torch.cat(layer_keys, dim=2))
             init_values.append(torch.cat(layer_values, dim=2))

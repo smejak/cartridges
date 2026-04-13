@@ -199,6 +199,38 @@ def evaluate_stack(patient_ids: list[str], capture_attention: bool = True) -> di
 
 
 # ---------------------------------------------------------------------------
+# Phase 4a-rope: Stacked evaluation with RoPE adjustment
+# ---------------------------------------------------------------------------
+
+@app.function(gpu="H100", timeout=3600, **COMMON_KWARGS)
+def evaluate_stack_rope(patient_ids: list[str], capture_attention: bool = True) -> dict:
+    """Evaluate a stacked cartridge with RoPE-adjusted position re-indexing.
+
+    Same as evaluate_stack but uses stack_caches_rope_adjusted so that each
+    cache's keys get sequential (non-overlapping) position encodings.
+    """
+    _setup_env()
+    volume.reload()
+
+    from evaluate_stacked import evaluate_stacked
+    df = evaluate_stacked(
+        patient_ids=patient_ids,
+        capture_attention=capture_attention,
+        log_to_wandb=True,
+        rope_adjust=True,
+    )
+    overall_acc = df["is_correct"].mean()
+    per_patient = df.groupby("question_patient")["is_correct"].mean().to_dict()
+    return {
+        "patient_ids": patient_ids,
+        "ordering": "_".join(patient_ids),
+        "rope_adjust": True,
+        "overall_accuracy": float(overall_acc),
+        "per_patient_accuracy": {k: float(v) for k, v in per_patient.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Phase 4b: Permutation evaluation batch
 # ---------------------------------------------------------------------------
 
@@ -213,6 +245,52 @@ def evaluate_permutation_batch(tasks: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Remote orchestrator — this is what --detach keeps alive
 # ---------------------------------------------------------------------------
+
+@app.function(gpu="H100", timeout=600, **COMMON_KWARGS)
+def fixup_patient01_cache() -> bool:
+    """One-time fix: patient_01's cache was saved to a subdirectory.
+    Copy it to the expected location so evaluate_stacked can find it."""
+    _setup_env()
+    volume.reload()
+    from config import patient_cache_path, patient_cache_dir
+    import shutil
+
+    expected = patient_cache_path("patient_01")
+    old_path = os.path.join(
+        patient_cache_dir("patient_01"),
+        "stacking_patient_01_toks512",
+        "cache_last.pt",
+    )
+
+    if os.path.exists(expected):
+        print(f"  patient_01 cache already at {expected}")
+        return True
+
+    if os.path.exists(old_path):
+        # old_path is a symlink to cache-stepNNN.pt; resolve and copy
+        real_old = os.path.realpath(old_path)
+        print(f"  Copying {real_old} → {expected}")
+        shutil.copy2(real_old, expected)
+        volume.commit()
+        return True
+
+    # Try downloading from wandb as last resort
+    try:
+        import wandb
+        print("  Downloading patient_01 cache from wandb run 9ovgs3z9...")
+        os.makedirs(patient_cache_dir("patient_01"), exist_ok=True)
+        out = wandb.restore(
+            "cache-step293.pt",
+            run_path="jakub-smekal/cartridges/9ovgs3z9",
+            root=patient_cache_dir("patient_01"),
+        )
+        shutil.copy2(out.name, expected)
+        volume.commit()
+        return True
+    except Exception as e:
+        print(f"  Failed to download from wandb: {e}")
+        return False
+
 
 @app.function(timeout=86400, **COMMON_KWARGS)  # no GPU, 24h timeout
 def orchestrate(phase: int = 0, patient_idxs: list[int] = None):
@@ -238,25 +316,30 @@ def orchestrate(phase: int = 0, patient_idxs: list[int] = None):
             print(f"  {r['patient_id']}: accuracy={r['accuracy']:.2%}")
 
     if phase in (0, 4):
+        # --- Fixup: ensure patient_01 cache is at the expected path ---
+        print("\n[Fixup] Checking patient_01 cache path...")
+        fixup_patient01_cache.remote()
+
         # --- Phase 4a: Canonical stacked evaluations ---
-        print("\n[Phase 4a] Canonical stacked evaluations...")
-        canonical_handles = []
+        # Single-patient evals (5 GPUs) + canonical stacks (4 GPUs) = 9 GPUs
+        print("\n[Phase 4a] Canonical stacked evaluations (9 GPUs)...")
+        all_handles = []
+
+        # Single-patient evals (for k=1 data in figures)
+        for pid in PATIENT_IDS:
+            print(f"  Submitting single: [{pid}]")
+            all_handles.append(("single", pid, evaluate_stack.spawn([pid], capture_attention=False)))
+
+        # Canonical stack evals (k=2..5)
         for k in range(2, len(PATIENT_IDS) + 1):
             pids = PATIENT_IDS[:k]
             print(f"  Submitting k={k}: {pids}")
-            canonical_handles.append(evaluate_stack.spawn(pids, capture_attention=True))
+            all_handles.append(("canonical", k, evaluate_stack.spawn(pids, capture_attention=True)))
 
-        # Also evaluate each single patient for figures
-        single_handles = []
-        for pid in PATIENT_IDS:
-            single_handles.append(evaluate_stack.spawn([pid], capture_attention=False))
-
-        for h in canonical_handles:
+        # Wait for all Phase 4a to complete before starting 4b
+        for label, key, h in all_handles:
             r = h.get()
-            print(f"  {r['ordering']}: overall={r['overall_accuracy']:.2%}")
-        for h in single_handles:
-            r = h.get()
-            print(f"  {r['ordering']}: {r['overall_accuracy']:.2%}")
+            print(f"  [{label} {key}] {r['ordering']}: overall={r['overall_accuracy']:.2%}")
 
         # --- Phase 4b: Permutation evaluations ---
         print(f"\n[Phase 4b] Permutation evaluations...")
